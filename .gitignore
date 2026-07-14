@@ -1,0 +1,5 @@
+/runs
+/runs_mo
+/runs_nrpa
+__pycache__/
+*.pyc
