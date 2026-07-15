@@ -164,34 +164,39 @@ class ParetoNRPA_EAS_Emb:
     # ------------------------------------------------------------------
 
     def _teacher_force_logprob(self, pref: torch.Tensor, key: torch.Tensor, tour: np.ndarray) -> torch.Tensor:
-        """Log-probability of `tour` under (pref, key), WITH grad w.r.t. key."""
-        env = TSPEnv(problem_size=self.problem_size, pomo_size=1)
-        env.batch_size = 1
-        env.problems = self.problem
-        env.BATCH_IDX = torch.zeros((1, 1), dtype=torch.long, device=self.device)
-        env.POMO_IDX = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+        """Log-probability of `tour` under (pref, key), WITH grad w.r.t. key.
+
+        Teacher-forcing a *known* tour has no autoregressive dependency between
+        steps (mask/last-node at step t is a deterministic function of
+        tour[:t]), so all T-1 decode steps are computed as a single batched
+        decoder call on the pomo axis instead of a T-1-iteration Python loop —
+        the same trick PMOCO uses for pomo/multi-start rollouts, just applied
+        to time steps here. This was previously the dominant cost: ~T decoder
+        forward+step calls at batch size 1 per sequence, per Adapt call.
+        """
+        tour_t = torch.as_tensor(tour, dtype=torch.long, device=self.device).view(1, -1)  # (1, T)
+        problem_len = tour_t.shape[1]
 
         self._use_pref_and_key(pref, key)
-        env.reset()
 
-        tour_t = torch.as_tensor(tour, dtype=torch.long, device=self.device).view(1, 1, -1)
-
-        first_action = tour_t[:, :, 0]
+        first_action = tour_t[:, :1]
         with torch.no_grad():
             encoded_first_node = _get_encoding(self.encoded_nodes, first_action)
             self.model.decoder.set_q1(encoded_first_node)
-        state, reward, done = env.step(first_action)
 
-        log_prob = torch.zeros((), device=self.device)
-        step = 1
-        while not done:
-            encoded_last_node = _get_encoding(self.encoded_nodes, state.current_node)
-            probs = self.model.decoder(encoded_last_node, ninf_mask=state.ninf_mask)
-            action = tour_t[:, :, step]
-            chosen_prob = probs.gather(2, action.unsqueeze(2)).squeeze(2)
-            log_prob = log_prob + chosen_prob.log().squeeze()
-            state, reward, done = env.step(action)
-            step += 1
+        prev_nodes = tour_t[:, : problem_len - 1]  # (1, T-1): tour[0..T-2], the "last visited" at each step
+        next_actions = tour_t[:, 1:]  # (1, T-1): tour[1..T-1], the target action at each step
+        encoded_last_nodes = _get_encoding(self.encoded_nodes, prev_nodes)  # (1, T-1, embedding)
+
+        # ninf_mask[0, s, :] excludes every node visited in tour[0..s] (inclusive),
+        # matching TSPEnv.step's cumulative visited-node masking.
+        visited_one_hot = torch.nn.functional.one_hot(prev_nodes[0], num_classes=self.problem_size).float()
+        cum_visited = visited_one_hot.cumsum(dim=0)  # (T-1, problem_size)
+        ninf_mask = torch.where(cum_visited > 0, float("-inf"), 0.0).unsqueeze(0)  # (1, T-1, problem_size)
+
+        probs = self.model.decoder(encoded_last_nodes, ninf_mask=ninf_mask)  # (1, T-1, problem_size)
+        chosen_probs = probs.gather(2, next_actions.unsqueeze(2)).squeeze(2)  # (1, T-1)
+        log_prob = chosen_probs.log().sum()
 
         return log_prob
 
